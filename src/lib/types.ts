@@ -31,6 +31,66 @@ export interface BNFApiResponse {
   warning?: string;
 }
 
+// ── ATM Vega Trend Dashboard ─────────────────────────────────────────────────
+
+export type VegaTrendSignal =
+  | 'BULLISH'
+  | 'BEARISH'
+  | 'SIDEWAYS BULLISH'
+  | 'SIDEWAYS BEARISH'
+  | 'SIDEWAYS';
+
+export interface VegaTrendRule {
+  signal: VegaTrendSignal;
+  minDiff: number;
+  maxDiff: number;
+}
+
+export interface VegaTrendConfig {
+  symbol: string;
+  expiryDate: string;
+  strikeWindow: number;
+  captureStartTime: string;
+  captureEndTime: string;
+  pollIntervalMs: number;
+  rules: VegaTrendRule[];
+}
+
+export interface VegaMetricRow {
+  label: 'DAY OPEN' | 'CURRENT' | 'DIFFERENCE';
+  callVega: number | null;
+  putVega: number | null;
+  diff: number | null;
+  trend: VegaTrendSignal | null;
+}
+
+export interface VegaHistoryRow {
+  time: string;
+  capturedAt: string;
+  callVega: number;
+  putVega: number;
+  diff: number;
+  trend: VegaTrendSignal;
+}
+
+export interface VegaDashboardData {
+  symbol: string;
+  expiryDate: string | null;
+  underlyingValue: number | null;
+  atmStrike: number | null;
+  selectedStrikeCount: number;
+  summary: VegaMetricRow[];
+  history: VegaHistoryRow[];
+  config: VegaTrendConfig;
+}
+
+export interface VegaApiResponse {
+  data: VegaDashboardData;
+  lastUpdated: string;
+  source: 'live' | 'mock';
+  warning?: string;
+}
+
 // ── Admin Notes ───────────────────────────────────────────────────────────────
 
 export interface AdminNote {
