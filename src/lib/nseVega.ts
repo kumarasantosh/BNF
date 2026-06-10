@@ -8,6 +8,7 @@ import type {
   VegaTrendSignal,
 } from './types';
 import { supabase } from './supabase';
+import { calculateGreeks } from './greeks';
 
 const NSE_BASE = 'https://www.nseindia.com';
 const IST_TIME_ZONE = 'Asia/Kolkata';
@@ -74,6 +75,7 @@ interface VegaSessionState {
   dateKey: string;
   dayOpen: VegaSnapshot | null;
   history: VegaHistoryRow[];
+  reBaselinedAt: string | null; // ISO timestamp when we re-baselined due to calc method change
 }
 
 interface VegaDbRow {
@@ -206,18 +208,93 @@ function getConfig(): VegaTrendConfig {
     rules: rules?.length
       ? rules
       : [
-          { signal: 'BULLISH', minDiff: -VERY_LARGE_DIFF, maxDiff: -strongThreshold },
-          { signal: 'BEARISH', minDiff: strongThreshold, maxDiff: VERY_LARGE_DIFF },
-          { signal: 'SIDEWAYS BULLISH', minDiff: -strongThreshold, maxDiff: -neutralBand },
-          { signal: 'SIDEWAYS BEARISH', minDiff: neutralBand, maxDiff: strongThreshold },
+          { signal: 'BEARISH', minDiff: -VERY_LARGE_DIFF, maxDiff: -strongThreshold },
+          { signal: 'BULLISH', minDiff: strongThreshold, maxDiff: VERY_LARGE_DIFF },
+          { signal: 'SIDEWAYS BEARISH', minDiff: -strongThreshold, maxDiff: -neutralBand },
+          { signal: 'SIDEWAYS BULLISH', minDiff: neutralBand, maxDiff: strongThreshold },
           { signal: 'SIDEWAYS', minDiff: -neutralBand, maxDiff: neutralBand },
         ],
   };
 }
 
-function getTrend(diff: number, config: VegaTrendConfig): VegaTrendSignal {
-  const rule = config.rules.find((item) => diff >= item.minDiff && diff <= item.maxDiff);
-  return rule?.signal ?? 'SIDEWAYS';
+interface TrendInput {
+  callVega: number;   // Call Vega change from baseline
+  putVega: number;    // Put Vega change from baseline
+  diff: number;       // Put Vega - Call Vega (current)
+  diffHistory: number[]; // Array of previous diff values
+}
+
+function getTrend(input: TrendInput): VegaTrendSignal {
+  const { callVega, putVega, diff, diffHistory } = input;
+
+  const GAP_THRESHOLD = 2.0;
+  const NEUTRAL_BAND = 2.0;
+  const REVERSAL_DROP = 10.0;
+  const REVERSAL_PEAK = 15;
+
+  // ── Method A: Individual Call vs Put Vega sign analysis ──
+  // When call and put vega are moving in clearly opposite directions,
+  // this gives the strongest and most unambiguous signal.
+  const callPositive = callVega > NEUTRAL_BAND;
+  const callNegative = callVega < -NEUTRAL_BAND;
+  const putPositive = putVega > NEUTRAL_BAND;
+  const putNegative = putVega < -NEUTRAL_BAND;
+
+  // Call Vega +ve & Put Vega -ve → Bullish (call writers losing, put writers gaining)
+  if (callPositive && putNegative) return 'BULLISH';
+  // Put Vega +ve & Call Vega -ve → Bearish (put writers losing, call writers gaining)
+  if (putPositive && callNegative) return 'BEARISH';
+  // Both negative → Sideways (both decaying, consolidation)
+  if (callNegative && putNegative) return 'SIDEWAYS';
+
+  // ── Method B: Single Vega (Put - Call) gap/momentum analysis ──
+  // Used when Method A doesn't give a clear opposite-sign signal.
+
+  // Reversal detection: check for peaks in recent history
+  if (diffHistory.length >= 3) {
+    const window = [...diffHistory.slice(-10), diff];
+    const maxPos = Math.max(...window);
+    const minNeg = Math.min(...window);
+
+    // Was bearish (high positive peak), now dropping → reversal to Bullish
+    if (maxPos > REVERSAL_PEAK && (maxPos - diff) >= REVERSAL_DROP) {
+      return 'BULLISH';
+    }
+    // Was bullish (deep negative peak), now rising → reversal to Bearish
+    if (minNeg < -REVERSAL_PEAK && (diff - minNeg) >= REVERSAL_DROP) {
+      return 'BEARISH';
+    }
+  }
+
+  // Sideways: diff fluctuates tightly around zero
+  if (Math.abs(diff) <= NEUTRAL_BAND) {
+    return 'SIDEWAYS';
+  }
+
+  // Gap analysis: measure momentum over last 3 data points
+  let avgGap = 0;
+  if (diffHistory.length >= 2) {
+    const recent = [...diffHistory.slice(-2), diff];
+    const gaps: number[] = [];
+    for (let i = 1; i < recent.length; i++) {
+      gaps.push(Math.abs(recent[i] - recent[i - 1]));
+    }
+    avgGap = gaps.reduce((a, b) => a + b, 0) / gaps.length;
+  } else {
+    avgGap = Math.abs(diff); // First data point, use magnitude
+  }
+
+  // Negative diff with gaps → Bullish; without gaps → Sideways Bullish
+  if (diff < -NEUTRAL_BAND) {
+    return avgGap >= GAP_THRESHOLD ? 'BULLISH' : 'SIDEWAYS BULLISH';
+  }
+
+  // Positive diff with gaps → Bearish; without gaps → Sideways Bearish
+  if (diff > NEUTRAL_BAND) {
+    return avgGap >= GAP_THRESHOLD ? 'BEARISH' : 'SIDEWAYS BEARISH';
+  }
+
+  return 'SIDEWAYS';
 }
 
 function getIstWeekday(date = new Date()): string {
@@ -379,6 +456,22 @@ function normalizeExpiryDate(value: string | null | undefined): string | null {
   return upper;
 }
 
+function getTimeToExpiryYears(expiryDateStr: string | null): number {
+  if (!expiryDateStr) return 0;
+  // Normalize date format if necessary
+  const normalized = normalizeExpiryDate(expiryDateStr) ?? expiryDateStr;
+  const expiryDate = new Date(normalized);
+  if (isNaN(expiryDate.getTime())) return 0;
+  
+  // Expiry is generally 15:30 IST (10:00 UTC)
+  expiryDate.setUTCHours(10, 0, 0, 0); 
+  
+  const now = new Date();
+  const diffMs = expiryDate.getTime() - now.getTime();
+  const diffYears = diffMs / (1000 * 60 * 60 * 24 * 365.25);
+  return Math.max(0, diffYears);
+}
+
 function buildSnapshotFromNse(json: NseOptionChainResponse, config: VegaTrendConfig): VegaSnapshot {
   const { time } = getIstParts();
   const allRows = json.data?.length
@@ -416,22 +509,43 @@ function buildSnapshotFromNse(json: NseOptionChainResponse, config: VegaTrendCon
   }
 
   const atmIndex = strikes.indexOf(atmStrike);
-  const selectedStrikes = new Set(
-    strikes.slice(
-      Math.max(0, atmIndex - config.strikeWindow),
-      Math.min(strikes.length, atmIndex + config.strikeWindow + 1),
-    ),
-  );
+  const selectedStrikes = new Set(strikes); // Delta filter will naturally narrow this down
 
   let callTotal = 0;
   let putTotal = 0;
+  let validStrikes = 0;
+
+  const T = getTimeToExpiryYears(expiryDate);
+  const r = 0.10; // Standard assumed 10% risk-free rate for Indian markets
 
   for (const row of expiryRows) {
     const strike = toNumber(row.strikePrice);
     if (strike == null || !selectedStrikes.has(strike)) continue;
 
-    callTotal += impliedVolatility(row.CE);
-    putTotal += impliedVolatility(row.PE);
+    const callIv = impliedVolatility(row.CE) / 100;
+    const putIv = impliedVolatility(row.PE) / 100;
+
+    let includeCall = false;
+    let includePut = false;
+
+    if (callIv > 0 && underlyingValue != null) {
+      const callGreeks = calculateGreeks(underlyingValue, strike, T, r, callIv, true);
+      if (callGreeks.delta >= 0.05 && callGreeks.delta <= 0.60) {
+        callTotal += callGreeks.vega;
+        includeCall = true;
+      }
+    }
+
+    if (putIv > 0 && underlyingValue != null) {
+      const putGreeks = calculateGreeks(underlyingValue, strike, T, r, putIv, false);
+      const absPutDelta = Math.abs(putGreeks.delta);
+      if (absPutDelta >= 0.05 && absPutDelta <= 0.60) {
+        putTotal += putGreeks.vega;
+        includePut = true;
+      }
+    }
+
+    if (includeCall || includePut) validStrikes++;
   }
 
   if (callTotal <= 0 && putTotal <= 0) {
@@ -450,17 +564,36 @@ function buildSnapshotFromNse(json: NseOptionChainResponse, config: VegaTrendCon
     expiryDate,
     underlyingValue,
     atmStrike,
-    selectedStrikeCount: selectedStrikes.size,
+    selectedStrikeCount: validStrikes,
   };
 }
 
 function getSession(now = new Date()): VegaSessionState {
   const { dateKey } = getIstParts(now);
   if (!vegaSession || vegaSession.dateKey !== dateKey) {
+    // Hardcoded Day Open for 2026-06-10 — the 09:15 snapshot wasn't captured
+    // with the new Black-Scholes method. Remove this override after today.
+    const OVERRIDE_DATE = '2026-06-10';
+    const overrideDayOpen: VegaSnapshot | null = dateKey === OVERRIDE_DATE
+      ? {
+          capturedAt: `${OVERRIDE_DATE}T03:45:00.000+00:00`, // 09:15 IST
+          time: '09:15',
+          callTotal: 197.73,
+          putTotal: 194.84,
+          rawDiff: -2.89,
+          expiryDate: '16-Jun-2026',
+          underlyingValue: null,
+          atmStrike: null,
+          selectedStrikeCount: 0,
+        }
+      : null;
+
     vegaSession = {
       dateKey,
-      dayOpen: null,
+      dayOpen: overrideDayOpen,
       history: [],
+      // Set to current time so all previously written (stale) DB rows are excluded
+      reBaselinedAt: overrideDayOpen ? new Date().toISOString() : null,
     };
   }
 
@@ -536,7 +669,7 @@ async function fetchDbDayOpen(dateKey: string, config: VegaTrendConfig): Promise
 function buildSummary(
   dayOpen: VegaSnapshot,
   current: VegaSnapshot,
-  config: VegaTrendConfig,
+  diffHistory: number[],
 ): VegaMetricRow[] {
   const callChange = round2(current.callTotal - dayOpen.callTotal);
   const putChange = round2(current.putTotal - dayOpen.putTotal);
@@ -562,7 +695,7 @@ function buildSummary(
       callVega: callChange,
       putVega: putChange,
       diff: diffChange,
-      trend: getTrend(diffChange, config),
+      trend: getTrend({ callVega: callChange, putVega: putChange, diff: diffChange, diffHistory }),
     },
   ];
 }
@@ -639,14 +772,42 @@ async function persistSnapshot(
 async function buildDashboardData(snapshot: VegaSnapshot, config: VegaTrendConfig): Promise<DashboardBuildResult> {
   const dateKey = getIstParts(new Date(snapshot.capturedAt)).dateKey;
   const session = getSession();
-  const dbDayOpen = await fetchDbDayOpen(dateKey, config);
 
-  if (!session.dayOpen && isAtOrAfterTime(snapshot.time, config.captureStartTime)) {
-    session.dayOpen = dbDayOpen ?? snapshot;
+  // If we've already re-baselined this session, use the session Day Open and skip DB
+  let isStaleBaseline = false;
+  if (!session.reBaselinedAt) {
+    const dbDayOpen = await fetchDbDayOpen(dateKey, config);
+
+    if (!session.dayOpen && isAtOrAfterTime(snapshot.time, config.captureStartTime)) {
+      session.dayOpen = dbDayOpen ?? snapshot;
+    }
+
+    const dayOpenCandidate = dbDayOpen ?? session.dayOpen ?? snapshot;
+
+    // Guard against stale baselines: if the Day Open was captured with a different
+    // calculation method (e.g. old IV-sum vs new Black-Scholes Vega), the scale
+    // will be wildly different. Detect this and re-baseline with current snapshot.
+    const dayOpenScale = Math.abs(dayOpenCandidate.callTotal) + Math.abs(dayOpenCandidate.putTotal);
+    const currentScale = Math.abs(snapshot.callTotal) + Math.abs(snapshot.putTotal);
+    const scaleRatio = currentScale > 0 ? dayOpenScale / currentScale : 1;
+    isStaleBaseline = scaleRatio > 1.8 || scaleRatio < 0.55;
+
+    if (isStaleBaseline) {
+      console.warn(
+        `[NSE Vega] Day Open scale mismatch detected (ratio ${scaleRatio.toFixed(2)}). ` +
+        `DayOpen: ${dayOpenScale.toFixed(2)}, Current: ${currentScale.toFixed(2)}. Re-baselining.`
+      );
+      session.dayOpen = snapshot;
+      session.history = []; // Clear stale history
+      session.reBaselinedAt = snapshot.capturedAt;
+    } else {
+      session.dayOpen = dayOpenCandidate;
+    }
   }
 
-  const dayOpen = dbDayOpen ?? session.dayOpen ?? snapshot;
-  const summary = buildSummary(dayOpen, snapshot, config);
+  const dayOpen = session.dayOpen ?? snapshot;
+  const historyDiffs = session.history.map((row) => row.diff);
+  const summary = buildSummary(dayOpen, snapshot, historyDiffs);
   const difference = summary.find((row) => row.label === 'DIFFERENCE');
 
   if (difference?.callVega != null && difference.putVega != null && difference.diff != null && difference.trend) {
@@ -661,8 +822,24 @@ async function buildDashboardData(snapshot: VegaSnapshot, config: VegaTrendConfi
   }
 
   const dbWarning = await persistSnapshot(snapshot, dayOpen, summary, config, dateKey);
-  const dbRows = await fetchDbRows(dateKey, config);
-  const history = dbRows?.length ? dbRows.map(historyFromDbRow) : session.history;
+
+  // If we re-baselined, don't load stale DB rows — use fresh session history only
+  let history: VegaHistoryRow[];
+  if (isStaleBaseline) {
+    history = session.history;
+  } else {
+    const dbRows = await fetchDbRows(dateKey, config);
+    if (dbRows?.length) {
+      let rows = dbRows;
+      // Filter out rows captured before a re-baseline event
+      if (session.reBaselinedAt) {
+        rows = rows.filter((r) => r.captured_at >= session.reBaselinedAt!);
+      }
+      history = rows.length ? rows.map(historyFromDbRow) : session.history;
+    } else {
+      history = session.history;
+    }
+  }
 
   return {
     data: {
@@ -708,8 +885,8 @@ function buildMockDashboard(config: VegaTrendConfig): VegaDashboardData {
       capturedAt: `${dateKey}T${rowTime}:00+05:30`,
       callVega: callChange,
       putVega: putChange,
-      diff,
-      trend: getTrend(diff, config),
+      diff: diff,
+      trend: getTrend({ callVega: callChange, putVega: putChange, diff, diffHistory: history.map((r) => r.diff) }),
     });
   }
 
@@ -742,7 +919,7 @@ function buildMockDashboard(config: VegaTrendConfig): VegaDashboardData {
     underlyingValue: current.underlyingValue,
     atmStrike: current.atmStrike,
       selectedStrikeCount: current.selectedStrikeCount,
-      summary: buildSummary(dayOpen, current, config),
+      summary: buildSummary(dayOpen, current, history.map((r) => r.diff)),
       history,
     config,
   };

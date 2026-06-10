@@ -182,16 +182,7 @@ function VegaChart({ history }: { history: VegaHistoryRow[] }) {
             dot={{ r: 2, strokeWidth: 1 }}
             activeDot={{ r: 4 }}
           />
-          <Line
-            type="monotone"
-            dataKey="diff"
-            name="Diff"
-            stroke="#f59e0b"
-            strokeWidth={2}
-            dot={false}
-            strokeDasharray="6 4"
-          />
-        </LineChart>
+          </LineChart>
       </ResponsiveContainer>
     </div>
   );
