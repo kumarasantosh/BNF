@@ -92,6 +92,8 @@ interface VegaDbRow {
   underlying_value: number | string | null;
   atm_strike: number | string | null;
   selected_strike_count: number | string;
+  day_open_call_vega: number | string;
+  day_open_put_vega: number | string;
 }
 
 interface DashboardBuildResult {
@@ -617,13 +619,16 @@ function snapshotFromDbRow(row: VegaDbRow): VegaSnapshot {
   };
 }
 
-function historyFromDbRow(row: VegaDbRow): VegaHistoryRow {
+function historyFromDbRow(row: VegaDbRow, dayOpen: VegaSnapshot): VegaHistoryRow {
+  const callVega = round2(Number(row.call_vega) - dayOpen.callTotal);
+  const putVega = round2(Number(row.put_vega) - dayOpen.putTotal);
+  const diff = round2(putVega - callVega);
   return {
     time: row.captured_time,
     capturedAt: row.captured_at,
-    callVega: Number(row.call_vega_change),
-    putVega: Number(row.put_vega_change),
-    diff: Number(row.diff_change),
+    callVega,
+    putVega,
+    diff,
     trend: row.trend,
   };
 }
@@ -646,6 +651,8 @@ async function fetchDbRows(dateKey: string, config: VegaTrendConfig): Promise<Ve
         'underlying_value',
         'atm_strike',
         'selected_strike_count',
+        'day_open_call_vega',
+        'day_open_put_vega',
       ].join(', '),
     )
     .eq('trading_date', dateKey)
@@ -823,22 +830,19 @@ async function buildDashboardData(snapshot: VegaSnapshot, config: VegaTrendConfi
 
   const dbWarning = await persistSnapshot(snapshot, dayOpen, summary, config, dateKey);
 
-  // If we re-baselined, don't load stale DB rows — use fresh session history only
+  // Recalculate ALL DB rows from their absolute values against the current Day Open
   let history: VegaHistoryRow[];
-  if (isStaleBaseline) {
-    history = session.history;
-  } else {
-    const dbRows = await fetchDbRows(dateKey, config);
-    if (dbRows?.length) {
-      let rows = dbRows;
-      // Filter out rows captured before a re-baseline event
-      if (session.reBaselinedAt) {
-        rows = rows.filter((r) => r.captured_at >= session.reBaselinedAt!);
-      }
-      history = rows.length ? rows.map(historyFromDbRow) : session.history;
-    } else {
-      history = session.history;
+  const dbRows = await fetchDbRows(dateKey, config);
+  if (dbRows?.length && dayOpen) {
+    history = dbRows.map((r) => historyFromDbRow(r, dayOpen));
+    // Recompute trends using recalculated values
+    for (let i = 0; i < history.length; i++) {
+      const h = history[i];
+      const prevDiffs = history.slice(0, i).map((p) => p.diff);
+      h.trend = getTrend({ callVega: h.callVega, putVega: h.putVega, diff: h.diff, diffHistory: prevDiffs });
     }
+  } else {
+    history = session.history;
   }
 
   return {
